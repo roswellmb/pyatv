@@ -280,12 +280,15 @@ async def test_scan_with_zeroconf_complete_and_device_info():
 @pytest.mark.asyncio
 async def test_scan_with_zeroconf_complete_and_device_info_specific_host_matching():
     aiozc, browser = await _create_zc_with_cache(COMPLETE_RECORD_SET_WITH_DEVICE_INFO)
-    results = await scan(
-        asyncio.get_event_loop(),
-        hosts=["192.168.107.184"],
-        timeout=0,
-        aiozc=aiozc,
-    )
+    with patch("zeroconf.Zeroconf.async_send") as mock_async_send:
+        results = await scan(
+            asyncio.get_event_loop(),
+            hosts=["192.168.107.184"],
+            timeout=0,
+            aiozc=aiozc,
+        )
+    # Device is complete without every type, so no unicast PTR fallback
+    assert not [c for c in mock_async_send.mock_calls if len(c[1]) > 1]
     atv: AppleTV = results[0]
     assert isinstance(atv, AppleTV)
     assert "_sleep-proxy._udp.local" in atv.properties
@@ -388,10 +391,33 @@ async def test_scan_with_zeroconf_unicast_not_found():
     target = last_call[1]
     assert target == "127.0.0.1"
     dns_outgoing: DNSOutgoing = last_call[0]
-    assert len(dns_outgoing.questions) == 1
-    question = dns_outgoing.questions[0]
-    assert question.name == "_device-info._tcp.local."
-    assert question.unicast is True
+    question_names = {question.name for question in dns_outgoing.questions}
+    assert "_device-info._tcp.local." in question_names
+    assert "_airplay._tcp.local." in question_names
+    assert all(question.unicast for question in dns_outgoing.questions)
     assert not results
+    await browser.async_cancel()
+    await aiozc.async_close()
+
+
+@pytest.mark.asyncio
+async def test_scan_with_zeroconf_unicast_empty_cache_queries_all_types():
+    """Empty cache (e.g. right after a restart) must query every scanned type."""
+    aiozc, browser = await _create_zc_with_cache([])
+    loop = asyncio.get_event_loop()
+    with patch("zeroconf.Zeroconf.async_send") as mock_async_send:
+        await scan(loop, timeout=0, aiozc=aiozc, hosts=["127.0.0.1"])
+    question_names = {
+        question.name
+        for call in mock_async_send.mock_calls
+        if call[1][1] == "127.0.0.1"
+        for question in call[1][0].questions
+    }
+    # Sleep proxy is never queried unicast
+    expected = set(ALL_MDNS_SERVICES) - {
+        "_device_info._tcp.local.",
+        "_sleep-proxy._udp.local.",
+    }
+    assert question_names == expected | {"_device-info._tcp.local."}
     await browser.async_cancel()
     await aiozc.async_close()

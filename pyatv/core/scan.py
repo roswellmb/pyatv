@@ -544,7 +544,7 @@ class ZeroconfUnicastScanner(ZeroconfScanner):
         # Once info_by_address_type is filled in, we are done.
         self.infos_by_address_type: Dict[
             IPv4Address, Dict[str, Optional[AsyncServiceInfo]]
-        ] = {host: {f"{type_}.": None for type_ in self._services} for host in hosts}
+        ] = {}
 
     def _send_ptr_queries(self, address: IPv4Address, needed_types: List[str]) -> None:
         """Send PTR queries."""
@@ -580,13 +580,31 @@ class ZeroconfUnicastScanner(ZeroconfScanner):
             if address := device_name_to_address.get(name):
                 infos_by_address_type[address][DEVICE_INFO_TYPE] = info
 
+    def _missing_types(self, host: IPv4Address) -> List[str]:
+        """Return types to send unicast PTR queries for, empty if host is done.
+
+        No device has every service type, so once a host has one service only
+        missing device info is asked for. We do not send queries for sleep
+        proxy because it is not useful if multicast is broken and it is not
+        required to complete service discovery.
+        """
+        infos_by_type = self.infos_by_address_type[host]
+        missing = [
+            type_
+            for type_, info in infos_by_type.items()
+            if info is None and type_ != SLEEP_PROXY_TYPE
+        ]
+        if any(
+            info is not None
+            for type_, info in infos_by_type.items()
+            if type_ not in (DEVICE_INFO_TYPE, SLEEP_PROXY_TYPE)
+        ):
+            return [type_ for type_ in missing if type_ == DEVICE_INFO_TYPE]
+        return missing
+
     def _all_services_discovered(self) -> bool:
         """Check if all services have been discovered."""
-        for types in self.infos_by_address_type.values():
-            for info in types.values():
-                if info is None:
-                    return False
-        return True
+        return not any(self._missing_types(host) for host in self.hosts)
 
     def _process_matching_service_infos(
         self,
@@ -641,6 +659,10 @@ class ZeroconfUnicastScanner(ZeroconfScanner):
         self, zc_timeout: float
     ) -> Tuple[Dict[IPv4Address, List[AsyncServiceInfo]], Dict[str, str]]:
         """Lookup services and aggregate them by address."""
+        # Built here and not in __init__, since services are added after that
+        self.infos_by_address_type = {
+            host: {f"{type_}.": None for type_ in self._services} for host in self.hosts
+        }
         infos = self._build_service_info_queries()
         if await self._load_from_cache_or_send_queries(infos, zc_timeout):
             return self._process_matching_service_infos()
@@ -648,16 +670,8 @@ class ZeroconfUnicastScanner(ZeroconfScanner):
         # Multicast is likely broken, the device is offline,
         # or the network is dropping multicast responses.
         # We will try to send unicast PTR queries for the missing types.
-        infos_by_address_type = self.infos_by_address_type
         for host in self.hosts:
-            # We do not send queries for sleep proxy because
-            # sleepy proxy is not useful if multicast is broken
-            # and its not required to complete service discovery.
-            if needed_types := [
-                type_
-                for type_, info in infos_by_address_type[host].items()
-                if info is None and type_ != SLEEP_PROXY_TYPE
-            ]:
+            if needed_types := self._missing_types(host):
                 _LOGGER.debug(
                     "%s: Multicast is broken or device offline, "
                     "trying unicast PTR queries for %s",
